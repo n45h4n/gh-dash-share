@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+	printf 'ghd: %s\n' "$*" >&2
+	exit 1
+}
+
+# Resolve links with BSD-compatible readlink; macOS system Bash has no realpath.
+launcher="${BASH_SOURCE[0]}"
+link_count=0
+while [ -L "$launcher" ]; do
+	link_count=$((link_count + 1))
+	[ "$link_count" -le 40 ] || die 'launcher symlink loop'
+	launcher_directory="$(cd -P "$(dirname "$launcher")" && pwd -P)"
+	link_target="$(readlink "$launcher")" || die 'unable to resolve launcher link'
+	case "$link_target" in
+		/*) launcher="$link_target" ;;
+		*) launcher="$launcher_directory/$link_target" ;;
+	esac
+done
+bundle="$(cd -P "$(dirname "$launcher")/.." && pwd -P)" || die 'unable to resolve installed bundle'
+[ -r "$bundle/gh-dash/config.yml" ] || die "bundled configuration is missing: $bundle/gh-dash/config.yml"
+
+# Pin both the worker root and config even when the caller has personal defaults.
+for argument in "$@"; do
+	case "$argument" in
+		--config|--config=*) die 'the bundled configuration cannot be replaced' ;;
+		--*) ;;
+		-*c*) die 'the bundled configuration cannot be replaced (-c)' ;;
+	esac
+done
+
+source_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die 'not inside a Git repository'
+source_root="$(cd -P "$source_root" && pwd -P)" || die 'unable to resolve the source root'
+source_branch="$(git -C "$source_root" symbolic-ref --quiet --short HEAD 2>/dev/null)" || die 'detached HEAD is not supported'
+source_sha="$(git -C "$source_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || die 'unable to resolve the current commit'
+source_repo="$(
+	cd "$source_root"
+	unset GH_REPO
+	gh repo view --json nameWithOwner --jq '.nameWithOwner'
+)" || die 'unable to resolve the canonical GitHub repository'
+[ -n "$source_repo" ] || die 'the canonical GitHub repository is empty'
+[[ "$source_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'the canonical GitHub repository is malformed'
+source_status="$(git -C "$source_root" status --porcelain --untracked-files=normal 2>/dev/null)" || die 'unable to inspect the source checkout state'
+if [ -n "$source_status" ]; then
+	source_dirty=1
+	printf 'ghd: warning: the source checkout is dirty; uncommitted changes are not included in Git worktrees\n' >&2
+else
+	source_dirty=0
+fi
+
+export DOTFILES_DIR="$bundle"
+export GH_DASH_SOURCE_ROOT="$source_root"
+export GH_DASH_SOURCE_REPO="$source_repo"
+export GH_DASH_SOURCE_BRANCH="$source_branch"
+export GH_DASH_SOURCE_SHA="$source_sha"
+export GH_DASH_SOURCE_DIRTY="$source_dirty"
+exec gh dash --config "$bundle/gh-dash/config.yml" "$@"
